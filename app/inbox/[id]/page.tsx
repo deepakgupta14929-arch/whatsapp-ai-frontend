@@ -1,23 +1,33 @@
-"use client"; // This is a client-side React component (can use hooks, browser APIs)
+"use client";
 
-import { useEffect, useState, useCallback } from "react"; // React hooks
-import { useParams } from "next/navigation"; // To read the dynamic [id] from the URL
-import { SalesCoachPanel } from "@/app/components/analytics/SalesCoachPanel"; // Right-side AI coach
-import VisitBookingModal from "@/app/components/VisitBookingModal"; // Visit booking popup
+/**
+ * Lead chat page (client component)
+ *
+ * - Fetches messages for a lead (polling).
+ * - Shows visit banner if a latest visit exists.
+ * - Allows manual reply (POST to backend).
+ * - Opens VisitBookingModal and refreshes banner after booking.
+ *
+ * Replace the file at app/inbox/[id]/page.tsx with this code.
+ */
 
-// Base URL of your backend API (fallback to localhost:1400 if env is missing)
+import { useEffect, useState, useCallback } from "react";
+import { useParams } from "next/navigation";
+import { SalesCoachPanel } from "@/app/components/analytics/SalesCoachPanel";
+import VisitBookingModal from "@/app/components/VisitBookingModal";
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:1400";
 
-// ---------- Types for data coming from backend ----------
+/* ---------- Types ---------- */
 
-// One chat message in the conversation
+// One chat message
 type Message = {
   from: string; // "lead" | "bot" | "agent"
-  text: string; // message text
-  at?: string;  // ISO timestamp (optional)
+  text: string;
+  at?: string;
 };
 
-// Lead + its messages returned from /api/leads/:id/messages
+// Lead + its messages as returned by /api/leads/:id/messages
 type LeadData = {
   leadId: string;
   name?: string;
@@ -25,268 +35,279 @@ type LeadData = {
   messages: Message[];
 };
 
-// One site-visit booking
+// One visit record (minimal)
 type Visit = {
   _id: string;
-  date: string;        // ISO date string
-  timeSlot: string;    // e.g. "morning" | "afternoon" | "evening"
-  visitStatus: string; // "pending" | "completed" | "cancelled"
+  date: string;
+  timeSlot: string;
+  visitStatus: string;
   familyComing?: boolean;
   pickupRequired?: boolean;
   notes?: string;
-  // leadId can be a string OR a populated object, depending on your API
-  leadId?: string | { _id: string; name?: string };
 };
 
-// ---------- Main page component for /inbox/[id] ----------
+/* ---------- Component ---------- */
 
 export default function LeadPage() {
-  // Read /inbox/[id] from the URL (Next.js router params)
+  // Get route param /inbox/[id]
   const params = useParams<{ id: string }>();
-  const leadId = params.id as string;
+  const leadId = params?.id as string;
 
-  // State: current lead + messages
+  // Chat / lead state
   const [lead, setLead] = useState<LeadData | null>(null);
-
-  // State: loading + error for messages
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // State: input box + sending flag for manual replies
+  // Input & sending state
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
 
-  // State: latest visit for this lead (for green banner)
+  // Latest visit banner state
   const [latestVisit, setLatestVisit] = useState<Visit | null>(null);
 
-  // State: whether the "Book Visit" modal is opened
+  // Visit modal open/close
   const [showVisitModal, setShowVisitModal] = useState(false);
 
-  // ---------- Fetch messages for this lead ----------
-
-  // useCallback so we can reuse this in effects and after sending a reply
+  /* ---------------------------
+     Fetch messages for this lead
+     - Defensive logging so we can see what's happening in the browser console
+     - Normalizes returned payload into the shape UI expects
+     --------------------------- */
   const fetchMessages = useCallback(async () => {
-    if (!leadId) return; // safety guard
+    if (!leadId) {
+      console.warn("fetchMessages: no leadId (page mounted without id)");
+      return;
+    }
+
+    const url = `${API_URL}/api/leads/${leadId}/messages`;
+    console.log("fetchMessages: calling", url);
 
     try {
       setLoading(true);
       setError(null);
 
-      // Call backend to get lead + messages
-      const res = await fetch(`${API_URL}/api/leads/${leadId}/messages`, {
-        credentials: "include", // send cookies/session
-      });
+      const res = await fetch(url, { credentials: "include" });
+      console.log("fetchMessages: status", res.status);
 
-      if (!res.ok) {
-        throw new Error(`API error: ${res.status}`);
+      // read raw text to show any non-JSON error too
+      const text = await res.text();
+      console.log("fetchMessages: raw response text:", text?.slice?.(0, 200) ?? text);
+
+      let data: any;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch (parseErr) {
+        console.error("fetchMessages: JSON parse error", parseErr);
+        throw new Error("Invalid JSON from messages endpoint");
       }
 
-      const data = await res.json(); // expected: { leadId, name, phone, messages: [...] }
-      setLead(data); // store in state, triggers re-render
+      // Defensive normalization:
+      // Some backends return { messages: [...] } while others return { leadId, name, messages }
+      // We normalize to { leadId, name, messages }
+      let normalized: LeadData | null = null;
+      if (!data) {
+        normalized = null;
+      } else if (Array.isArray(data.messages)) {
+        // already has messages array
+        normalized = {
+          leadId: data.leadId ?? leadId,
+          name: data.name ?? data.leadName ?? data.name,
+          messages: data.messages,
+        };
+      } else if (Array.isArray(data)) {
+        // unexpectedly returned an array — treat it as messages
+        normalized = {
+          leadId,
+          name: undefined,
+          messages: data as Message[],
+        };
+      } else if (data.messages === undefined && data.messages === null && data.messages?.length === 0) {
+        // fallback
+        normalized = { leadId, name: data.name ?? undefined, messages: [] };
+      } else {
+        // last fallback — try to find messages key anywhere
+        const msgs = data.messages ?? data.data?.messages ?? [];
+        normalized = { leadId: data.leadId ?? leadId, name: data.name ?? undefined, messages: msgs };
+      }
+
+      console.log("fetchMessages: normalized:", {
+        leadId: normalized?.leadId,
+        name: normalized?.name,
+        messagesCount: normalized?.messages?.length ?? 0,
+      });
+
+      setLead(normalized);
     } catch (err: any) {
-      console.error(err);
-      setError(err.message || "Failed to load messages");
+      console.error("fetchMessages error:", err);
+      setError(err?.message || "Failed to load messages");
     } finally {
       setLoading(false);
     }
   }, [leadId]);
 
-  // ---------- Fetch latest visit for this lead (banner at top) ----------
+  /* ---------------------------
+     Fetch latest visit(s) then pick newest for this lead
+     - many backends don't expose lead-specific endpoint; this fetches all and filters
+     --------------------------- */
+  const fetchLatestVisit = useCallback(
+    async (currentLeadId: string) => {
+      if (!currentLeadId) return;
 
-  // This function loads ALL visits and then filters for this lead
-  async function loadVisitBanner(currentLeadId: string) {
-    try {
-      const res = await fetch(`${API_URL}/api/visits`, {
-        credentials: "include", // again, include session cookies
-      });
+      const url = `${API_URL}/api/visits`; // fetch all then filter client-side
+      console.log("fetchLatestVisit: calling", url, "for lead", currentLeadId);
 
-      if (!res.ok) {
-        console.error("Failed to load visits", res.status);
-        return;
-      }
-
-      const data = await res.json();          // expected: { visits: [...] }
-      const allVisits: Visit[] = data.visits || [];
-
-      // Only keep visits that belong to this lead
-      const visitsForLead = allVisits.filter((v) => {
-        if (!v.leadId) return false;
-
-        // Case 1: leadId is a string
-        if (typeof v.leadId === "string") {
-          return v.leadId === currentLeadId;
+      try {
+        const res = await fetch(url, { credentials: "include" });
+        if (!res.ok) {
+          console.error("fetchLatestVisit: failed status", res.status);
+          return;
         }
 
-        // Case 2: leadId is a populated object { _id, name, ... }
-        return v.leadId._id === currentLeadId;
-      });
+        const data = await res.json();
+        const allVisits: Visit[] = data?.visits ?? [];
 
-      if (visitsForLead.length === 0) {
-        setLatestVisit(null); // no visit → no banner
-        return;
+        // Filter visits that belong to this lead (leadId may be populated object or string)
+        const visitsForLead = allVisits.filter((v: any) => {
+          if (!v.leadId) return false;
+          if (typeof v.leadId === "string") return v.leadId === currentLeadId;
+          // populated object: v.leadId._id or v.leadId.id
+          return v.leadId._id === currentLeadId || v.leadId.id === currentLeadId;
+        });
+
+        if (visitsForLead.length === 0) {
+          setLatestVisit(null);
+          console.log("fetchLatestVisit: 0 visits for lead", currentLeadId);
+          return;
+        }
+
+        // pick newest by date
+        visitsForLead.sort((a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        const newest = visitsForLead[0];
+        console.log("fetchLatestVisit: newest for lead", currentLeadId, newest);
+        setLatestVisit(newest);
+      } catch (err) {
+        console.error("fetchLatestVisit error:", err);
       }
+    },
+    []
+  );
 
-      // Sort by date and pick the latest one
-      const latest = visitsForLead.sort(
-        (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
-      )[0];
-
-      setLatestVisit(latest); // store visit for banner
-    } catch (err) {
-      console.error("loadVisitBanner error:", err);
+  /* ---------------------------
+     Initial load and polling
+     - run on leadId change
+     --------------------------- */
+  useEffect(() => {
+    if (!leadId) {
+      console.warn("LeadPage: no leadId; skipping initial load");
+      return;
     }
-  }
 
-  // ---------- Send manual reply to backend ----------
+    // initial load
+    fetchMessages();
+    fetchLatestVisit(leadId);
 
+    // poll for messages every 5s
+    const id = setInterval(fetchMessages, 5000);
+    return () => clearInterval(id);
+  }, [leadId, fetchMessages, fetchLatestVisit]);
+
+  /* ---------------------------
+     Send manual reply via backend
+     - ensure endpoint path matches your backend; using /api/leads/:id/reply
+     --------------------------- */
   async function handleSend() {
     const text = input.trim();
-    if (!text || !leadId) return; // ignore empty messages
+    if (!text || !leadId) return;
+
+    const url = `${API_URL}/api/leads/${leadId}/reply`;
+    console.log("handleSend: POST to", url, "message:", text);
 
     try {
       setSending(true);
-
-      // POST to /leads/:id/reply (your existing backend route)
-      const res = await fetch(`${API_URL}/leads/${leadId}/reply`, {
+      const res = await fetch(url, {
         method: "POST",
         credentials: "include",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ message: text }).toString(),
       });
 
+      console.log("handleSend: status", res.status);
+      const tx = await res.text();
+      console.log("handleSend: raw response:", tx?.slice?.(0, 400) ?? tx);
+
       if (!res.ok) {
-        console.error("Send reply failed", res.status);
-      } else {
-        setInput("");        // clear input box
-        await fetchMessages(); // reload messages after sending
+        setError(`Send failed: ${res.status}`);
+        return;
       }
+
+      // refresh messages after success
+      setInput("");
+      await fetchMessages();
     } catch (err) {
-      console.error("Send reply error:", err);
+      console.error("handleSend error:", err);
+      setError((err as any)?.message || "Send failed");
     } finally {
       setSending(false);
     }
   }
 
-  // ---------- Effects ----------
-
-  // 1) Load messages initially + poll every 5 seconds
+  /* Helpful debug: log lead state when it changes in the browser console */
   useEffect(() => {
-    fetchMessages(); // initial load
+    console.log("lead state updated:", {
+      leadId: lead?.leadId,
+      name: lead?.name,
+      messagesCount: lead?.messages?.length ?? 0,
+    });
+  }, [lead]);
 
-    const id = setInterval(fetchMessages, 5000); // polling
-    return () => clearInterval(id); // cleanup on unmount
-  }, [fetchMessages]);
-
-  // 2) Load visit banner whenever leadId changes
-  useEffect(() => {
-    if (!leadId) return;
-    loadVisitBanner(leadId);
-  }, [leadId]);
-
-  // ---------- JSX UI ----------
-
+  /* ---------- Render ---------- */
   return (
     <div className="grid grid-cols-3 gap-4 h-full p-4">
-      {/* TOP ROW: Visit banner across the top */}
+      {/* TOP banner: show latest visit if present */}
       <div className="col-span-3 mb-2">
         {latestVisit && (
           <div className="text-[11px] px-3 py-1 rounded-full bg-emerald-900/40 border border-emerald-600/60 text-emerald-200 inline-flex items-center gap-2">
-            {/* Small green dot */}
             <span className="w-2 h-2 rounded-full bg-emerald-400" />
-            {/* Human-readable date/time + timeSlot + status */}
             <span>
-              Visit booked for{" "}
-              {new Date(latestVisit.date).toLocaleString("en-IN", {
-                day: "numeric",
-                month: "short",
-                year: "numeric",
-                hour: "numeric",
-                minute: "2-digit",
-              })}{" "}
-              — {latestVisit.timeSlot} (
-              {latestVisit.visitStatus || "pending"})
+              Visit booked for {new Date(latestVisit.date).toLocaleString()} — {latestVisit.timeSlot} ({latestVisit.visitStatus})
             </span>
           </div>
         )}
       </div>
 
-      {/* LEFT SIDE → Chat UI (2 columns wide) */}
+      {/* LEFT: Chat UI */}
       <div className="col-span-2 border border-slate-800 rounded-xl bg-slate-950 flex flex-col">
-        {/* Header: lead info + buttons */}
-        <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-          {/* Lead name + phone */}
+        {/* Header */}
+        <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between gap-2">
           <div>
-            <div className="text-sm font-semibold text-slate-50">
-              {lead?.name || "Lead"}
-            </div>
-            <div className="text-[11px] text-slate-400">
-              {lead?.phone || ""}
-            </div>
+            <div className="text-sm font-semibold text-slate-50">{lead?.name || "Lead"}</div>
+            <div className="text-[11px] text-slate-400">{lead?.phone || ""}</div>
           </div>
 
-          {/* Right side: buttons */}
-          <div className="flex items-center gap-2">
-            {/* Refresh chat button */}
-            <button
-              onClick={fetchMessages}
-              className="text-[11px] px-2 py-1 rounded border border-slate-700 hover:border-emerald-400"
-            >
+          <div className="flex gap-2">
+            <button onClick={fetchMessages} className="text-[11px] px-2 py-1 rounded border border-slate-700 hover:border-emerald-400">
               Refresh chat
             </button>
 
-            {/* Book visit button opens modal */}
-            <button
-              className="px-3 py-1 text-xs bg-emerald-600 rounded hover:bg-emerald-500"
-              onClick={() => setShowVisitModal(true)}
-            >
+            <button className="px-3 py-1 text-xs bg-emerald-600 rounded hover:bg-emerald-500" onClick={() => setShowVisitModal(true)}>
               📅 Book Visit
             </button>
           </div>
         </div>
 
-        {/* Messages area (scrollable) */}
+        {/* Messages */}
         <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2 text-xs">
-          {/* Loading indicator */}
-          {loading && (
-            <div className="text-slate-400 text-[11px]">
-              Loading messages…
-            </div>
+          {loading && <div className="text-slate-400 text-[11px]">Loading messages…</div>}
+          {error && <div className="text-red-400 text-[11px]">{error}</div>}
+          {!loading && (!lead || (lead.messages && lead.messages.length === 0)) && (
+            <div className="text-slate-500 text-[11px]">No messages yet for this lead.</div>
           )}
 
-          {/* Error message */}
-          {error && (
-            <div className="text-red-400 text-[11px]">
-              {error}
-            </div>
-          )}
-
-          {/* Empty state when no messages */}
-          {!loading && lead?.messages?.length === 0 && (
-            <div className="text-slate-500 text-[11px]">
-              No messages yet for this lead.
-            </div>
-          )}
-
-          {/* Actual message bubbles */}
           {lead?.messages?.map((msg, index) => {
-            const isAgent = msg.from === "bot" || msg.from === "agent"; // right side if bot/agent
-
+            const isAgent = msg.from === "bot" || msg.from === "agent";
             return (
-              <div
-                key={index}
-                className={`flex ${
-                  isAgent ? "justify-end" : "justify-start"
-                }`}
-              >
-                <div
-                  className={`max-w-[70%] rounded-2xl px-3 py-2 text-[11px] leading-snug ${
-                    isAgent
-                      ? "bg-emerald-600 text-white rounded-br-sm"
-                      : "bg-slate-800 text-slate-50 rounded-bl-sm"
-                  }`}
-                >
+              <div key={index} className={`flex ${isAgent ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[70%] rounded-2xl px-3 py-2 text-[11px] leading-snug ${isAgent ? "bg-emerald-600 text-white rounded-br-sm" : "bg-slate-800 text-slate-50 rounded-bl-sm"}`}>
                   {msg.text}
                 </div>
               </div>
@@ -294,9 +315,8 @@ export default function LeadPage() {
           })}
         </div>
 
-        {/* Input row for manual reply */}
+        {/* Input row */}
         <div className="border-t border-slate-800 px-4 py-3 flex items-center gap-2">
-          {/* Text input */}
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -309,36 +329,26 @@ export default function LeadPage() {
             placeholder="Type a manual WhatsApp reply to this lead…"
             className="flex-1 bg-slate-900 border border-slate-700 rounded-full px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-emerald-400"
           />
-
-          {/* Send button */}
-          <button
-            onClick={handleSend}
-            disabled={sending || !input.trim()}
-            className={`px-4 py-2 text-xs rounded-full ${
-              sending || !input.trim()
-                ? "bg-slate-700 text-slate-300 opacity-60 cursor-not-allowed"
-                : "bg-emerald-500 text-slate-900 hover:bg-emerald-400"
-            }`}
-          >
+          <button onClick={handleSend} disabled={sending || !input.trim()} className={`px-4 py-2 text-xs rounded-full ${sending || !input.trim() ? "bg-slate-700 text-slate-300 opacity-60 cursor-not-allowed" : "bg-emerald-500 text-slate-900 hover:bg-emerald-400"}`}>
             {sending ? "Sending…" : "Send"}
           </button>
         </div>
       </div>
 
-      {/* RIGHT SIDE → AI Sales Coach panel */}
+      {/* RIGHT: AI Sales Coach */}
       <div className="col-span-1">
         <SalesCoachPanel leadId={leadId} />
       </div>
 
-      {/* Visit booking modal (opens when showVisitModal is true) */}
+      {/* Visit booking modal */}
       {showVisitModal && (
         <VisitBookingModal
           leadId={leadId}
-          onClose={() => setShowVisitModal(false)} // close without doing anything
-          onSuccess={() => {
-            // After successful booking:
-            setShowVisitModal(false);  // close modal
-            loadVisitBanner(leadId);   // refresh the green banner
+          onClose={() => setShowVisitModal(false)}
+          onSuccess={async () => {
+            // After booking, close modal and refresh visits banner
+            setShowVisitModal(false);
+            await fetchLatestVisit(leadId);
           }}
         />
       )}
